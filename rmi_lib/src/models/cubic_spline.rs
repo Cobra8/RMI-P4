@@ -1,10 +1,10 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
+
 
 use crate::models::*;
 
@@ -168,27 +168,42 @@ impl Model for CubicSplineModel {
 
     fn code(&self) -> String {
         return String::from(
-            "
-inline double cubic(double a, double b, double c, double d, double x) {
-    auto v1 = std::fma(a, x, b);
-    auto v2 = std::fma(v1, x, c);
-    auto v3 = std::fma(v2, x, d);
-    return v3;
-}",
+"
+control LearnedCubic(in double_t a, in double_t b, in double_t c, in double_t d, in double_t input_key, out double_t result) {
+    FloatingFusedMultiplyAdd() first_fma;
+    FloatingFusedMultiplyAdd() second_fma;
+    FloatingFusedMultiplyAdd() third_fma;
+
+    apply {
+        first_fma.apply(a, input_key, b, result);
+        second_fma.apply(result, input_key, c, result);
+        third_fma.apply(result, input_key, d, result);
+    }
+}
+"
         );
     }
 
     fn function_name(&self) -> String {
         return String::from("cubic");
     }
+
     fn needs_bounds_check(&self) -> bool {
         return false;
+    }
+
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::ADD);
+        to_r.push(StdFunctions::MULTIPLY);
+        to_r.push(StdFunctions::FMA);
+        return to_r;
     }
 
     fn set_to_constant_model(&mut self, constant: u64) -> bool {
         self.params = (0.0, 0.0, 0.0, constant as f64);
         return true;
-    }    
+    }
 }
 
 #[cfg(test)]

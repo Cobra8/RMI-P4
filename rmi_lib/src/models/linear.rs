@@ -1,11 +1,11 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
- 
+//
+// < end copyright >
+
+
 
 use crate::models::*;
 
@@ -77,8 +77,7 @@ pub struct LinearModel {
 
 impl LinearModel {
     pub fn new<T: TrainingKey>(data: &RMITrainingData<T>) -> LinearModel {
-        let params = slr(data.iter()
-                         .map(|(inp, offset)| (inp.as_float(), offset as f64)));
+        let params = slr(data.iter().map(|(inp, offset)| (inp.as_float(), offset as f64)));
         return LinearModel { params };
     }
 }
@@ -102,15 +101,28 @@ impl Model for LinearModel {
 
     fn code(&self) -> String {
         return String::from(
-            "
-inline double linear(double alpha, double beta, double inp) {
-    return std::fma(beta, inp, alpha);
-}",
+"
+control LearnedLinear(in double_t a, in double_t b, in double_t input_key, out double_t result) {
+    FloatingFusedMultiplyAdd() fma_instance;
+
+    apply {
+        fma_instance.apply(b, input_key, a, result);
+    }
+}
+"
         );
     }
 
     fn function_name(&self) -> String {
         return String::from("linear");
+    }
+
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::ADD);
+        to_r.push(StdFunctions::MULTIPLY);
+        to_r.push(StdFunctions::FMA);
+        return to_r;
     }
 
     fn set_to_constant_model(&mut self, constant: u64) -> bool {
@@ -192,19 +204,24 @@ impl Model for LogLinearModel {
 
     fn code(&self) -> String {
         return String::from(
-            "
+"
 inline double loglinear(double alpha, double beta, double inp) {
-    return exp1(std::fma(beta, inp, alpha));
-}",
+    return 0; // TODO
+}
+"
         );
     }
 
     fn function_name(&self) -> String {
         return String::from("loglinear");
     }
-    fn standard_functions(&self) -> HashSet<StdFunctions> {
-        let mut to_r = HashSet::new();
-        to_r.insert(StdFunctions::EXP1);
+
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::ADD);
+        to_r.push(StdFunctions::MULTIPLY);
+        to_r.push(StdFunctions::FMA);
+        to_r.push(StdFunctions::EXP1);
         return to_r;
     }
 }
@@ -243,17 +260,16 @@ impl RobustLinearModel {
                 params: (0.0, 0.0)
             };
         }
-        
+
         let bnd = usize::max(1, ((total_items as f64) * 0.0001) as usize);
         assert!(bnd*2+1 < data.len());
-        
+
         let iter = data.iter()
             .skip(bnd)
             .take(data.len() - 2*bnd);
 
-        let robust_params = slr(iter
-                                .map(|(inp, offset)| (inp.as_float(), offset as f64)));
-        
+        let robust_params = slr(iter.map(|(inp, offset)| (inp.as_float(), offset as f64)));
+
         return RobustLinearModel {
             params: robust_params
         };
@@ -277,17 +293,31 @@ impl Model for RobustLinearModel {
         return vec![self.params.0.into(), self.params.1.into()];
     }
 
+
     fn code(&self) -> String {
         return String::from(
-            "
-inline double linear(double alpha, double beta, double inp) {
-    return std::fma(beta, inp, alpha);
-}",
+"
+control LearnedLinear(in double_t a, in double_t b, in double_t input_key, out double_t result) {
+    FloatingFusedMultiplyAdd() fma_instance;
+
+    apply {
+        fma_instance.apply(b, input_key, a, result);
+    }
+}
+"
         );
     }
-    
+
     fn function_name(&self) -> String {
         return String::from("linear");
+    }
+
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::ADD);
+        to_r.push(StdFunctions::MULTIPLY);
+        to_r.push(StdFunctions::FMA);
+        return to_r;
     }
 
     fn set_to_constant_model(&mut self, constant: u64) -> bool {

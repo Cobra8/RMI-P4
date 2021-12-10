@@ -1,7 +1,7 @@
 [package]
 name = "rmi_lib"
 version = "0.1.0"
-authors = ["Ryan Marcus <ryan@ryanmarc.us>"]
+authors = ["Ryan Marcus <ryan@ryanmarc.us> adapted by Lucas Bürgi <lucas.buerg@unifr.ch>"]
 edition = "2018"
 license = "MIT"
 
@@ -21,3 +21,5 @@ superslice = "1.0.0"
 json = "0.12.0"
 indicatif = "0.13.0"
 tabular = "0.1.4"
+itertools = "0.10.3"
+hex = "0.3.1"

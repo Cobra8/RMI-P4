@@ -1,29 +1,18 @@
-# RMI
+# RMI for P4
 
-[![Build Status](https://drone.rm.cab/api/badges/learnedsystems/RMI/status.svg)](https://drone.rm.cab/learnedsystems/RMI)
-
-This is a reference implementation of recursive model indexes (RMIs). A prototype RMI was initially described in [The Case for Learned Index Structures](https://arxiv.org/abs/1712.01208) by Kraska et al. in 2017.
+This is an implementation of the recursive model indexes (RMIs) specifically for generating P4 code. A prototype RMI was initially described in [The Case for Learned Index Structures](https://arxiv.org/abs/1712.01208) by Kraska et al. in 2017.
 
 ![Fig 1 from the Case for Learned Index Structures](http://people.csail.mit.edu/ryanmarcus/rmi.png)
 
-## RMI basics
+## The Original
 
-Like binary search trees, an RMI is a structure to help search through sorted data. Given a sorted array, an RMI is a function that maps a key to an approximate index. This approximate index can be used as a starting point for a linear, exponential, or binary search. The [SOSD benchmark](https://learned.systems/sosd) demonstrates that RMIs can outperform binary search and many other standard approaches as well.
-
-Unlike a binary search tree, an RMI uses machine learning techniques to build this approximation function. The result is normally a small, compact mathematical function that can be evaluated quickly. RMIs are a good tool when you need to search the same sorted data many times. Compared to other structures, RMIs:
-
-* (➕) Offer faster lookup times (when properly tuned)
-* (➕) Are generally much smaller than traditional structures like B-Trees or radix trees
-* (➖) Must be trained ahead of time on a dataset
-* (➖) Do not support inserts (without retraining the model)
-
-Many more details can be found in [the original paper](https://arxiv.org/abs/1712.01208).
+The original reference implementation that generates CPP code can be found at [learnedsystems/RMI](https://github.com/learnedsystems/RMI).
 
 ## Using this implementation
 
-To use the reference implementation, clone this repository and [install Rust](https://rustup.rs/).
+To use this implementation, clone this repository and [install Rust](https://rustup.rs/).
 
-The reference RMI implementation is a *compiler.* It takes a dataset as input, and produces C/C++ source files as outputs. The data input file must be a binary file containing:
+The reference RMI implementation is a *compiler.* It takes a dataset as input, and produces P4 source files as outputs. The data input file must be a binary file containing:
 
 1. The number of items, as a 64-bit unsigned integer (little endian)
 2. The data items, either 32-bit or 64-bit unsigned integers (little endian)
@@ -40,34 +29,8 @@ Logging useful diagnostic information can be enabled by setting the `RUST_LOG` e
 
 
 ## Generated code
-The RMI generator  produces C/C++ source files in the current directory. The command directly above, for example, produces the following output. The C/C++ sources contain a few publicly-exposed fields:
-
-```C++
-#include <cstddef>
-#include <cstdint>
-namespace wiki {
-    bool load(char const* dataPath);
-    void cleanup();
-    const size_t RMI_SIZE = 50331680;
-    const uint64_t BUILD_TIME_NS = 14288421237;
-    const char NAME[] = "wiki";
-    uint64_t lookup(uint64_t key, size_t* err);
-}
-
-```
-
-* The `RMI_SIZE` constant represents the size of the constructed model in bytes. 
-* The `BUILD_TIME_NS` field records how long it took to build the RMI, in nanoseconds. 
-* The `NAME` field is a constant you specify (and always matches the namespace name). 
-* The `load` function will need to be called before any calls to `lookup`. The `dataPath` parameter must the path to the directory containing the RMI data (`rmi_data` in this example / the default).
-* The `lookup` function takes in an unsigned, 64-bit integer key and produces an estimate of the offset. The `err` parameter will be populated with the maximum error from the RMI's prediction to the target key. This lookup error can be used to perform a bounded binary search. If the error of the trained RMI is low enough, linear search may give better performance.
-
-If you run the compiler with the `--no-errors` flag, the API will change to no longer report the maximum possible error of each lookup, saving some space.
-
-```c++
-uint64_t lookup(uint64_t key);
-```
-
+The RMI generator produces a P4 source file in the current directory.
+TODO - describe how to use P4 source file briefly here?
 
 ## RMI Layers and Tuning
 
@@ -98,24 +61,3 @@ The optimizer will output a table, with each row representing an RMI configurati
 * `AvgLg2`: the average log2 error of the model (which approximates the number of binary search steps required to find a particular key within a range predicted by the RMI)
 * `MaxLg2`: the maximum log2 error of the model (the maximum number of binary search steps required to find any key within the range predicted by the RMI)
 * `Size (b)`: the in-memory size of the RMI, in bytes.
-
-## Citation and license
-
-If you use this RMI implementation in your academic research, please cite the CDFShop paper:
-
-
-> Ryan Marcus, Emily Zhang, and Tim Kraska. 2020. CDFShop: Exploring and Optimizing Learned Index Structures. In Proceedings of the 2020 ACM SIGMOD International Conference on Management of Data (SIGMOD '20). Association for Computing Machinery, New York, NY, USA, 2789–2792. DOI:https://doi.org/10.1145/3318464.3384706
-
-
-If you are comparing a new index structure to learned approaches, or evaluating a new learned approach, please take a look at our [benchmark for learned index structures](https://learned.systems/sosd.
-
-For RMIs and learned index structures in general, one should cite the original paper:
-
-> Tim Kraska, Alex Beutel, Ed H. Chi, Jeffrey Dean, and Neoklis Polyzotis. 2018. The Case for Learned Index Structures. In Proceedings of the 2018 International Conference on Management of Data (SIGMOD '18). Association for Computing Machinery, New York, NY, USA, 489–504. DOI:https://doi.org/10.1145/3183713.3196909
-
-
-This work is freely available under the terms of the MIT license.
-
-## Contributors
-
-* [Ryan Marcus](https://rmarcus.info)

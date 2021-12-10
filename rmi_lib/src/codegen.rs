@@ -1,24 +1,42 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
- 
+//
+// < end copyright >
 
-use crate::models::Model;
 use crate::models::*;
+use crate::models::Model;
+use crate::train::TrainedRMI;
+
+use itertools::Itertools;
 use bytesize::ByteSize;
 use log::*;
-use std::collections::HashSet;
 use std::io::Write;
 use std::str;
-use crate::train::TrainedRMI;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::fmt;
+
+macro_rules! array_name {
+    ($layer: expr) => {
+        format!("L{}_PARAMETERS", $layer)
+    }
+}
+
+macro_rules! param_enumeration {
+    ($idx: expr) => { (["first", "second", "third", "fourth", "fifth", "sixth"])[$idx] }
+}
+
+macro_rules! pred_to_model_index {
+    ($from: expr) => {
+        match $from {
+            ModelDataType::Float => "        double_to_int(fpred, model_index);",
+            ModelDataType::Int => "        model_index = ipred;",
+        };
+    }
+}
 
 
 enum LayerParams {
@@ -27,25 +45,9 @@ enum LayerParams {
     MixedArray(usize, usize, Vec<ModelParam>)
 }
 
-macro_rules! constant_name {
-    ($layer:expr, $idx: expr) => {
-        format!("L{}_PARAMETER{}", $layer, $idx)
-    };
-}
-
-
-macro_rules! array_name {
-    ($layer: expr) => {
-        format!("L{}_PARAMETERS", $layer)
-    }
-}
-
 impl LayerParams {
 
-    fn new(idx: usize,
-           array_access: bool,
-           params_per_model: usize,
-           params: Vec<ModelParam>) -> LayerParams {
+    fn new(idx: usize, array_access: bool, params_per_model: usize, params: Vec<ModelParam>) -> LayerParams {
         // first, if the underlying data is mixed, we can only support array mode.
         let first_param = params.first().unwrap();
         let mixed = !params.iter().all(|p| first_param.is_same_type(p));
@@ -61,110 +63,59 @@ impl LayerParams {
 
         return LayerParams::Constant(idx, params);
     }
-    
-    fn to_code<T: Write>(&self, target: &mut T) -> Result<(), std::io::Error> {
+
+    fn table_code<T: Write>(&self, namespace: &str, data_dir: &str, needed_vars: &mut Vec<String>, target: &mut T) -> Result<(), std::io::Error> {
+        let mut table_code = Vec::new();
+
         match self {
-            LayerParams::Constant(idx, params) => {
-                for (p_idx, param) in params.iter().enumerate() {
-                    writeln!(
-                        target,
-                        "const {} {}{} = {};",
-                        param.c_type(),
-                        constant_name!(idx, p_idx),
-                        param.c_type_mod(),
-                        param.c_val()
-                    )?;
-                }
-            }
+            LayerParams::Constant(_, _) => (),
+            LayerParams::Array(idx, _, _) | LayerParams::MixedArray(idx, _, _) => {
+                let data_path = Path::new(&data_dir).join(format!("{}_{}", namespace, array_name!(idx)));
+                let f = File::create(data_path).expect("Could not write data file to RMI directory");
+                let mut bw = BufWriter::new(f);
+                self.write_to(&mut bw)?; // write to data file
 
-            LayerParams::Array(idx, _, params) => {
-                write!(
-                    target,
-                    "const {} {}[] = {{",
-                    params[0].c_type(),
-                    array_name!(idx)
-                )?;
+                let model_items = self.params()[0..self.params_per_model()].to_vec();
 
-                let (last, rest) = params.split_last().unwrap();
-                for param in rest {
-                    write!(target, "{},", param.c_val())?;
-                }
-                write!(target, "{}", last.c_val())?;
-                writeln!(target, "}};")?;
-            },
+                let args = model_items.iter().enumerate().map(|(param_idx, param)|
+                    format!("out {} {}", param.p4_type(), self.param_name(param_idx, *idx))
+                ).join(", ");
+                table_code.push(format!("control L{}_ModelLookup(in uint64_t model_index, {}) {{", idx, args));
 
-            LayerParams::MixedArray(_, _, _) => {
-                panic!("Cannot hardcode mixed array.");
+                    let detailed_args = model_items.iter().enumerate().map(|(param_idx, param)|
+                        param.p4_detailed(self.param_name(param_idx, *idx))
+                    ).join(", ");
+                    table_code.push(format!("    action assign_variables({}) {{", detailed_args));
+                        model_items.iter().enumerate().for_each(|(param_idx, param)| table_code.push(param.p4_assign(self.param_name(param_idx, *idx))));
+                    table_code.push("    }".to_string());
+
+                    table_code.push(format!("    table l{}_model_lookup {{", *idx));
+                        table_code.push("        key = { model_index: exact; }".to_string());
+                        table_code.push("        actions = { assign_variables; NoAction; }".to_string());
+                        table_code.push("        const default_action = assign_variables(0, 0, 0, 0, 0, 0, 0);".to_string());
+                        table_code.push(format!("        const size = {};", self.size()));
+                    table_code.push("    }".to_string());
+
+                    table_code.push(format!("    apply {{ l{}_model_lookup.apply(); }}", *idx));
+                table_code.push("}".to_string());
+
+                needed_vars.push(format!("L{}_ModelLookup() l{}_lookup;", *idx, *idx));
+                model_items.iter().enumerate().for_each(|(param_idx, param)| {
+                    needed_vars.push(format!("{} {};", param.p4_type(), self.param_name(param_idx, *idx)));
+                });
             }
         };
+
+        for line in table_code {
+            writeln!(target, "{}", line)?;
+        }
 
         return Result::Ok(());
     }
-
-    fn requires_malloc(&self) -> bool {
-        return match self {
-            LayerParams::Array(_, _, params) => {
-                let array_size: usize = params.iter().map(|p| p.size()).sum();
-                return array_size >= 4 * 1024;
-            },
-            LayerParams::MixedArray(_, _, _) => true,
-            LayerParams::Constant(_, _) => false,
-        }; 
-    }
-
-    fn pointer_type(&self) -> &'static str {
-        assert!(self.requires_malloc());
-        return match self {
-            LayerParams::Array(_, _, params) => params[0].c_type(),
-            LayerParams::MixedArray(_, _, _) => "char",
-            LayerParams::Constant(_, _) => panic!("No pointer type for constant params")
-        };
-    }
-    
-    fn to_decl<T: Write>(&self, target: &mut T) -> Result<(), std::io::Error> {
-        match self {
-            LayerParams::Constant(_, _) => {
-                panic!("Cannot forward-declare constants");
-            }
-
-            LayerParams::Array(idx, _, params) => {
-                if !self.requires_malloc()  {
-                    let num_items: usize = params.iter().map(|p| p.len()).sum();
-                    writeln!(
-                        target,
-                        "{} {}[{}];",
-                        params[0].c_type(),
-                        array_name!(idx),
-                        num_items
-                    )?;
-                } else { 
-                    writeln!(
-                        target,
-                        "{}* {};",
-                        params[0].c_type(),
-                        array_name!(idx)
-                    )?;
-                }
-            },
-
-            LayerParams::MixedArray(idx, _, _) => {
-                assert!(self.requires_malloc());
-                writeln!(
-                    target,
-                    "char* {};",
-                    array_name!(idx)
-                )?;
-            }
-        };
-
-        return Result::Ok(());
-    }
-
 
     fn write_to<T: Write>(&self, target: &mut T) -> Result<(), std::io::Error> {
-        match self {   
-            LayerParams::Array(_idx, _, params) |
-            LayerParams::MixedArray(_idx, _, params) => {
+        match self {
+            LayerParams::Array(_idx, _, params) | LayerParams::MixedArray(_idx, _, params) => {
                 let (first, rest) = params.split_first().unwrap();
 
                 first.write_to(target)?;
@@ -176,200 +127,68 @@ impl LayerParams {
                 }
                 return Ok(());
             },
-            LayerParams::Constant(_, _) =>
-                panic!("Cannot write constant parameters to binary file.")
-        };
-    }
-
-    fn params(&self) -> &[ModelParam] {
-        return match self {
-            LayerParams::Array(_, _, params) |
-            LayerParams::MixedArray(_, _, params)
-                => params,
-            LayerParams::Constant(_, params) => params
+            LayerParams::Constant(_, _) => panic!("Cannot write constant parameters to binary file.")
         };
     }
 
     fn index(&self) -> usize {
         return match self {
-            LayerParams::Array(idx, _, _) |
-            LayerParams::MixedArray(idx, _, _)
-                => *idx,
+            LayerParams::Array(idx, _, _) | LayerParams::MixedArray(idx, _, _) => *idx,
             LayerParams::Constant(idx, _) => *idx
+        };
+    }
+
+    fn params(&self) -> &[ModelParam] {
+        return match self {
+            LayerParams::Array(_, _, params) | LayerParams::MixedArray(_, _, params) => params,
+            LayerParams::Constant(_, params) => params
         };
     }
 
     fn params_per_model(&self) -> usize {
         return match self {
-            LayerParams::Array(_idx, ppm, _params) |
-            LayerParams::MixedArray(_idx, ppm, _params)
-                => *ppm,
+            LayerParams::Array(_idx, ppm, _params) | LayerParams::MixedArray(_idx, ppm, _params) => *ppm,
             LayerParams::Constant(_, params) => params.len()
         };
+    }
+
+    fn param_name(&self, param_idx: usize, layer_idx: usize) -> String {
+        return format!("{}_l{}", param_enumeration!(param_idx), layer_idx);
     }
 
     fn size(&self) -> usize {
         return self.params().iter().map(|p| p.size()).sum();
     }
 
-
-    fn access_by_const<T: Write>(
-        &self,
-        target: &mut T,
-        parameter_index: usize,
-    ) -> Result<(), std::io::Error> {
-        if let LayerParams::Constant(idx, _) = self {
-            write!(target, "{}", constant_name!(idx, parameter_index))?;
-            return Result::Ok(());
-        }
-        return self.access_by_ref(target, "0", parameter_index);
-    }
-
-    fn access_by_ref<T: Write>(
-        &self,
-        target: &mut T,
-        model_index: &str,
-        parameter_index: usize
-    ) -> Result<(), std::io::Error> {
-
-        if self.params()[0].is_array() {
-            assert_eq!(self.params().len(), 1,
-                       "Layer params with array had more than one member.");
-            write!(target, "{}", array_name!(self.index()))?;
-            return Result::Ok(());
-        }
-        
-        match self {
-            LayerParams::Constant(idx, _) => {
-                panic!(
-                    "Cannot access constant parameters by reference on layer {}",
-                    idx
-                );
-            }
-
-            LayerParams::Array(idx, params_per_model, params) => {
-                if params[0].is_array() {
-                    assert_eq!(params.len(), 1);
-                }
-                let expr = format!("{}*{} + {}",
-                                   params_per_model, model_index, parameter_index);
-                write!(target, "{}[{}]", array_name!(idx), expr)?;
-            },
-
-            LayerParams::MixedArray(idx, params_per_model, params) => {
-                // determine the number of bytes for each model
-                let mut bytes_per_model = 0;
-                for item in params.iter().take(*params_per_model) {
-                    bytes_per_model += item.size();
-                }
-                // determine the byte offset of this parameter
-                let mut offset = 0;
-                for item in params.iter().take(parameter_index) {
-                    offset += item.size();
-                }
-                
-                // we have to determine the type of the index being accessed
-                // and add the appropiate cast.
-                let c_type = params[parameter_index].c_type();
-                let ptr_expr = format!("{} + ({} * {}) + {}",
-                                       array_name!(idx),
-                                       model_index, bytes_per_model,
-                                       offset);
-                                       
-                write!(target, "*(({new_type}*) ({ptr_expr}))",
-                       new_type=c_type, ptr_expr=ptr_expr)?;
-                
-            }
-        };
-
-        return Result::Ok(());
-    }
-
     fn with_zipped_errors(&self, lle: &[u64]) -> LayerParams {
-        
-        let params = self.params();
-        // integrate the errors into the model parameters of the last
-        // layer to save a cache miss.
-        
-        // TODO we should add padding to make sure each of these are
-        // cache-aligned. Also a lot of unneeded copying going on here...
+        let params = self.params(); // TODO - integrate the errors into the model parameters of the last layer to save a cache miss.
         let combined_lle_params: Vec<ModelParam> =
             params.chunks(self.params_per_model())
-            .zip(lle)
-            .flat_map(|(mod_params, err)| {
+            .zip(lle).flat_map(|(mod_params, err)| {
                 let mut to_r: Vec<ModelParam> = Vec::new();
                 to_r.extend_from_slice(mod_params);
                 to_r.push(ModelParam::Int(*err));
                 to_r
             }).collect();
 
-        let is_constant = if let LayerParams::Constant(_, _) = self {
-            true
-        } else {
-            false
-        };
-        
-        return LayerParams::new(self.index(), is_constant, self.params_per_model() + 1,
-                                combined_lle_params);
-                                
+        let is_constant = if let LayerParams::Constant(_, _) = self { true } else { false };
+        return LayerParams::new(self.index(), is_constant, self.params_per_model() + 1, combined_lle_params);
     }
 }
 
-impl fmt::Display for LayerParams {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LayerParams::Constant(idx, params) =>
-                write!(f, "Constant(idx: {}, len: {}, malloc: {})",
-                       idx, params.len(), self.requires_malloc()),
-            LayerParams::Array(idx, ppm, params) =>
-                write!(f, "Array(idx: {}, ppm: {}, len: {}, malloc: {})",
-                       idx, ppm, params.len(), self.requires_malloc()),
-            LayerParams::MixedArray(idx, ppm, params) =>
-                write!(f, "MixedArray(idx: {}, ppm: {}, len: {}, malloc: {})",
-                       idx, ppm, params.len(), self.requires_malloc())
-                
-        }
+fn first_uppercase(s: String) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
 
-fn params_for_layer(layer_idx: usize,
-                    models: &[Box<dyn Model>])
-                    -> LayerParams {
+fn params_for_layer(layer_idx: usize, models: &[Box<dyn Model>]) -> LayerParams {
     let params_per_model = models[0].params().len();
     let params = models.iter().flat_map(|m| m.params()).collect();
-    return LayerParams::new(layer_idx,
-                            models.len() > 1, // array access on non-singleton layers
-                            params_per_model,
-                            params);
-}
-
-macro_rules! model_index_from_output {
-    ($from: expr, $bound: expr, $needs_check: expr) => {
-        match $from {
-            ModelDataType::Float => {
-                if $needs_check {
-                    format!("FCLAMP(fpred, {}.0 - 1.0)", $bound)
-                } else {
-                    format!("(uint64_t) fpred")
-                }
-            }
-            ModelDataType::Int => {
-                if $needs_check {
-                    format!("(ipred > {0} - 1 ? {0} - 1 : ipred)", $bound)
-                } else {
-                    format!("ipred")
-                }
-            }
-            ModelDataType::Int128 => {
-                if $needs_check {
-                    format!("(i128pred > {0} - 1 ? {0} - 1 : i128pred)", $bound)
-                } else {
-                    format!("i128pred")
-                }
-            }
-
-        }
-    };
+    return LayerParams::new(layer_idx, models.len() > 1, // array access on non-singleton layers
+                            params_per_model, params);
 }
 
 pub fn rmi_size(rmi: &TrainedRMI) -> u64 {
@@ -377,7 +196,7 @@ pub fn rmi_size(rmi: &TrainedRMI) -> u64 {
     let mut num_total_bytes = 0;
     for layer in rmi.rmi.iter() {
         let model_on_this_layer_size: usize = layer[0].params().iter().map(|p| p.size()).sum();
-        
+
         // assume all models on this layer have the same size
         num_total_bytes += model_on_this_layer_size * layer.len();
     }
@@ -389,400 +208,510 @@ pub fn rmi_size(rmi: &TrainedRMI) -> u64 {
     if rmi.cache_fix.is_some() {
         num_total_bytes += rmi.cache_fix.as_ref().unwrap().1.len() * 16;
     }
-    
+
     return num_total_bytes as u64;
 }
 
-fn generate_cache_fix_code<T: Write>(
-    target: &mut T,
-    rmi: &TrainedRMI,
-    array_name: String) -> Result<(), std::io::Error> {
-
-    let num_splines = rmi.cache_fix.as_ref().unwrap().1.len();
-    let line_size = rmi.cache_fix.as_ref().unwrap().0;
-    let total_keys = rmi.num_data_rows;
-
+fn learning_headers<T: Write>(target: &mut T) -> Result<(), std::io::Error> {
     writeln!(target,
-             "
-struct __attribute__((packed)) SplinePoint {{
-  uint64_t key;
-  uint64_t value;
-}};
+"
+const bit<64> HIDDEN_BIT = 0x0010000000000000;
+const bit<11> EXPONENT_BIAS = 1023;
+const bit<1> SIGN_MINUS = 1;
+const bit<1> SIGN_PLUS = 0;
 
-uint64_t lookup(uint64_t key, size_t* err) {{
-  const uint64_t num_spline_pts = {};
-  const uint64_t total_keys = {};
-  size_t error_on_spline_search;
+typedef bit<64> uint64_t;
 
-  struct SplinePoint* begin = (struct SplinePoint*) {};
+typedef bit<1> sign_t;
+typedef bit<11> exponent_t;
+typedef bit<52> mantissa_t;
 
-  *err = {};
-  uint64_t start = _rmi_lookup_pre_cachefix(key, &error_on_spline_search);
+struct double_t {{
+    sign_t sign;
+    exponent_t exponent;
+    mantissa_t mantissa;
+}}
 
-  size_t upper = (start + error_on_spline_search > num_spline_pts
-                  ? num_spline_pts : start + error_on_spline_search);
-  size_t lower = (error_on_spline_search > start
-                  ? 0 : start - error_on_spline_search);
-                  
-  
-  struct SplinePoint* res = std::lower_bound(begin + lower,
-                                             begin + upper,
-                                             key,
-                                             [](const auto& lhs, const auto rhs) {{ return lhs.key < rhs; }});
+struct overflow128_t {{
+    sign_t sign;
+    exponent_t exponent;
+    bit<128> mantissa;
+}}
 
-  if (res == begin + num_spline_pts)
-    // we've searched for something past the last point
-    return total_keys - 1;
+/* custom learned header definition */
 
-  auto pt1 = *(res - 1);
-  auto pt2 = *res;
+header learned_t {{
+    double_t key;
 
-  auto v0 = (double)pt1.value;
-  auto v1 = (double)pt2.value;
-  auto t = ((double)(key - pt1.key)) / (double)(pt2.key - pt1.key);
-  return (((uint64_t) std::fma(1.0 - t, v0, t * v1)) / {3}) * {3};
-}}", num_splines, total_keys, array_name, line_size)?;
-    
-
+    uint64_t guess;
+    uint64_t err;
+}}
+"
+)?;
     return Ok(());
 }
 
-fn generate_code<T: Write>(
-    code_output: &mut T,
-    data_output: &mut T,
-    header_output: &mut T,
-    namespace: &str,
-    rmi: TrainedRMI,
-    data_dir: &str,
-    key_type: KeyType
-) -> Result<(), std::io::Error> {
-    // construct the code for the model parameters.
-    let mut layer_params: Vec<LayerParams> = rmi.rmi
-        .iter()
-        .enumerate()
-        .map(|(layer_idx, models)| params_for_layer(layer_idx, models))
-        .collect();
-    
-    let report_last_layer_errors = !rmi.last_layer_max_l1s.is_empty();
+fn learning_normalization<T: Write>(target: &mut T) -> Result<(), std::io::Error> {
+    writeln!(target,
+"
+/*************************************************************************
+****************** Custom actions and controls **************************
+*************************************************************************/
 
-    let mut report_lle: Vec<u8> = Vec::new();
-    if report_last_layer_errors {
-        let lle = &rmi.last_layer_max_l1s;
-        if lle.len() > 1 {
-            let old_last = layer_params.pop().unwrap();
-            let new_last = old_last.with_zipped_errors(lle);
-            
-            write!(report_lle, "  *err = ")?;
-            new_last.access_by_ref(&mut report_lle, "modelIndex",
-                                   new_last.params_per_model() - 1)?;
-            writeln!(report_lle, ";")?;
-            
-            layer_params.push(new_last);
-            
-        } else {
-            write!(report_lle, "  *err = {};", lle[0])?;
-        }
-    }
+/* ====================== Normalization ====================== */
 
-    if rmi.cache_fix.is_some() {
-        let cfv: Vec<ModelParam> = rmi.cache_fix.as_ref().unwrap().1.iter()
-            .flat_map(|(mi, offset)| vec![(*mi).into(), (*offset).into()])
-            .collect();
-        let cache_fix_params = LayerParams::new(
-            layer_params.len(), true, 2, cfv
-        );
+control FloatingNormalizer(inout overflow128_t overflow) {{
+    action floating_shift_left(inout overflow128_t result, bit<8> amount) {{
+        result.mantissa = result.mantissa << amount;
+        result.exponent = result.exponent - (exponent_t) amount;
+    }}
 
-        layer_params.push(cache_fix_params);
-    }
+    action floating_shift_right(inout overflow128_t result, bit<8> amount) {{
+        result.mantissa = result.mantissa >> amount;
+        result.exponent = result.exponent + (exponent_t) amount;
+    }}
 
-    trace!("Layer parameters:");
-    for lps in layer_params.iter() {
-        trace!("{}", lps);
-    }
+    table floating_normalize {{
+        key = {{
+            overflow.mantissa: ternary;
+        }}
+        actions = {{
+            floating_shift_left(overflow);
+            floating_shift_right(overflow);
+            NoAction;
+        }}
+        const default_action = NoAction();
+        const entries = {{
+            0b10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 75);
+            0b01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 74);
+            0b00100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 73);
+            0b00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 72);
+            0b00001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 71);
+            0b00000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 70);
+            0b00000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 69);
+            0b00000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 68);
+            0b00000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 67);
+            0b00000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 66);
+            0b00000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 65);
+            0b00000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 64);
+            0b00000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 63);
+            0b00000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 62);
+            0b00000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 61);
+            0b00000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 60);
+            0b00000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 59);
+            0b00000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 58);
+            0b00000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 57);
+            0b00000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 56);
+            0b00000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 55);
+            0b00000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 54);
+            0b00000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 53);
+            0b00000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 52);
+            0b00000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 51);
+            0b00000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 50);
+            0b00000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 49);
+            0b00000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 48);
+            0b00000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 47);
+            0b00000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 46);
+            0b00000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 45);
+            0b00000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 44);
+            0b00000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 43);
+            0b00000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 42);
+            0b00000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 41);
+            0b00000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 40);
+            0b00000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 39);
+            0b00000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 38);
+            0b00000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 37);
+            0b00000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 36);
+            0b00000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 35);
+            0b00000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 34);
+            0b00000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 33);
+            0b00000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 32);
+            0b00000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 31);
+            0b00000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 30);
+            0b00000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 29);
+            0b00000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 28);
+            0b00000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 27);
+            0b00000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 26);
+            0b00000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 25);
+            0b00000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 24);
+            0b00000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 23);
+            0b00000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 22);
+            0b00000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 21);
+            0b00000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 20);
+            0b00000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 19);
+            0b00000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 18);
+            0b00000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 17);
+            0b00000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 16);
+            0b00000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 15);
+            0b00000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 14);
+            0b00000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 13);
+            0b00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 12);
+            0b00000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 11);
+            0b00000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 10);
+            0b00000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 9);
+            0b00000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 8);
+            0b00000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 7);
+            0b00000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 6);
+            0b00000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 5);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 4);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 3);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 2);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000: floating_shift_right(overflow, 1);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000: NoAction;
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000: floating_shift_left(overflow, 1);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000: floating_shift_left(overflow, 2);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000: floating_shift_left(overflow, 3);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000: floating_shift_left(overflow, 4);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000: floating_shift_left(overflow, 5);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000: floating_shift_left(overflow, 6);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000: floating_shift_left(overflow, 7);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000: floating_shift_left(overflow, 8);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000: floating_shift_left(overflow, 9);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000: floating_shift_left(overflow, 10);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000: floating_shift_left(overflow, 11);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000: floating_shift_left(overflow, 12);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000: floating_shift_left(overflow, 13);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000: floating_shift_left(overflow, 14);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000: floating_shift_left(overflow, 15);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000: floating_shift_left(overflow, 16);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000: floating_shift_left(overflow, 17);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000: floating_shift_left(overflow, 18);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000: floating_shift_left(overflow, 19);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000: floating_shift_left(overflow, 20);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000: floating_shift_left(overflow, 21);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000: floating_shift_left(overflow, 22);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000: floating_shift_left(overflow, 23);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000: floating_shift_left(overflow, 24);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000: floating_shift_left(overflow, 25);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000: floating_shift_left(overflow, 26);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000: floating_shift_left(overflow, 27);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000: floating_shift_left(overflow, 28);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000: floating_shift_left(overflow, 29);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000: floating_shift_left(overflow, 30);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000: floating_shift_left(overflow, 31);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000: floating_shift_left(overflow, 32);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000: floating_shift_left(overflow, 33);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000: floating_shift_left(overflow, 34);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000: floating_shift_left(overflow, 35);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000: floating_shift_left(overflow, 36);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000: floating_shift_left(overflow, 37);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000: floating_shift_left(overflow, 38);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000000: floating_shift_left(overflow, 39);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000: floating_shift_left(overflow, 40);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000: floating_shift_left(overflow, 41);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000000: floating_shift_left(overflow, 42);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000: floating_shift_left(overflow, 43);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000: floating_shift_left(overflow, 44);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000000: floating_shift_left(overflow, 45);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000: floating_shift_left(overflow, 46);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000: floating_shift_left(overflow, 47);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110000: floating_shift_left(overflow, 48);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000: floating_shift_left(overflow, 49);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100: floating_shift_left(overflow, 50);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110: floating_shift_left(overflow, 51);
+            0b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001 &&& 0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111: floating_shift_left(overflow, 52);
+        }}
+    }}
 
-    writeln!(data_output, "namespace {} {{", namespace)?;    
-    
-    let mut read_code = Vec::new();
-    read_code.push("bool load(char const* dataPath) {".to_string());
-            
-    for lp in layer_params.iter() {
-        match lp {
-            // constants are put directly in the header 
-            LayerParams::Constant(_idx, _) => lp.to_code(data_output)?,
-            
-            LayerParams::Array(idx, _, _) |
-            LayerParams::MixedArray(idx, _, _) => {
-                let data_path = Path::new(&data_dir)
-                    .join(format!("{}_{}", namespace, array_name!(idx)));
-                let f = File::create(data_path)
-                    .expect("Could not write data file to RMI directory");
-                let mut bw = BufWriter::new(f);
-                
-                lp.write_to(&mut bw)?; // write to data file
-                lp.to_decl(data_output)?; // write to source code
-                
-                read_code.push("  {".to_string());
-                read_code.push(format!("    std::ifstream infile(std::filesystem::path(dataPath) / \"{ns}_{fn}\", std::ios::in | std::ios::binary);",
-                                       ns=namespace, fn=array_name!(idx)));
-                read_code.push("    if (!infile.good()) return false;".to_string());
-                if lp.requires_malloc() {
-                    read_code.push(format!("    {} = ({}*) malloc({});",
-                                           array_name!(idx), lp.pointer_type(), lp.size()));
-                    read_code.push(format!("    if ({} == NULL) return false;",
-                                           array_name!(idx)));
-                }
-                read_code.push(format!("    infile.read((char*){fn}, {size});",
-                                       fn=array_name!(idx), size=lp.size()));
-                read_code.push("    if (!infile.good()) return false;".to_string());
-                read_code.push("  }".to_string());
-            }
-        }
-    }
-    read_code.push("  return true;".to_string());
-    read_code.push("}".to_string());
+    apply {{
+        floating_normalize.apply();
+    }}
+}}
+"
+)?;
+    return Ok(());
+}
 
+fn generate_code<T: Write>(code_output: &mut T, namespace: &str, rmi: TrainedRMI, data_dir: &str, key_type: KeyType) -> Result<(), std::io::Error> {
+    /* document head with custom types */
+    writeln!(code_output,
+"
+/* -*- P4_16 -*- */
+#include <core.p4>
+#include <v1model.p4>
 
+const bit<16> TYPE_LEARNED = 0x8008; // custom ether type
 
-    let mut free_code = Vec::new();
-    free_code.push("void cleanup() {".to_string());
-    // generate free code
-    for lp in layer_params.iter() {
-        if !lp.requires_malloc() { continue; }
-        if let LayerParams::Array(idx, _, _) | LayerParams::MixedArray(idx, _, _) = lp {
-            free_code.push(format!("    free({});", array_name!(idx)));
-            continue;
-        }
-        panic!();
-    }
-    
-    free_code.push("}".to_string());
+/*************************************************************************
+*********************** H E A D E R S  ***********************************
+*************************************************************************/
 
-    writeln!(data_output, "}} // namespace")?;
+/* ethernet specific header definitions */
 
-    // get all of the required stdlib function signatures together
-    // TODO assumes all layers are homogenous
-    let mut decls = HashSet::new();
-    let mut sigs = HashSet::new();
-    for layer in rmi.rmi.iter() {
-        for stdlib in layer[0].standard_functions() {
-            decls.insert(stdlib.decl().to_string());
-            sigs.insert(stdlib.code().to_string());
-        }
-    }
+typedef bit<9>  egressSpec_t;
+typedef bit<48> macAddr_t;
+typedef bit<32> ip4Addr_t;
 
-    writeln!(code_output, "#include \"{}.h\"", namespace)?;
-    writeln!(code_output, "#include \"{}_data.h\"", namespace)?;
-    writeln!(code_output, "#include <math.h>")?;
-    writeln!(code_output, "#include <cmath>")?;
-    writeln!(code_output, "#include <fstream>")?;
-    writeln!(code_output, "#include <filesystem>")?;
-    writeln!(code_output, "#include <iostream>")?;
-    if rmi.cache_fix.is_some() {
-        writeln!(code_output, "#include <algorithm>")?;
-    }
+header ethernet_t {{
+    macAddr_t dstAddr;
+    macAddr_t srcAddr;
+    bit<16>   etherType;
+}}
 
-    writeln!(code_output, "namespace {} {{", namespace)?;
+/* learning specific header definitions */
 
-    for ln in read_code {
-        writeln!(code_output, "{}", ln)?;
-    }
-
-    for ln in free_code {
-        writeln!(code_output, "{}", ln)?;
-    }
-    
-    for decl in decls {
-        writeln!(code_output, "{}", decl)?;
-    }
-
-    for sig in sigs {
-        writeln!(code_output, "{}", sig)?;
-    }
-
-    // next, the model sigs
-    sigs = HashSet::new();
-    for layer in rmi.rmi.iter() {
-        sigs.insert(layer[0].code());
-    }
-
-    for sig in sigs {
-        writeln!(code_output, "{}", sig)?;
-    }
-
-    writeln!(
-        code_output,
-        "
-inline size_t FCLAMP(double inp, double bound) {{
-  if (inp < 0.0) return 0;
-  return (inp > bound ? bound : (size_t)inp);
-}}\n"
+/* floating point arithmetic definitions */
+"
     )?;
 
-    let rmi_lookup_name = if rmi.cache_fix.is_none() {
-        "lookup"
-    } else {
-        "_rmi_lookup_pre_cachefix"
-    };
-    
-    let lookup_sig = if report_last_layer_errors {
-        format!("uint64_t {}({} key, size_t* err)", rmi_lookup_name, key_type.c_type())
-    } else {
-        format!("uint64_t {}({} key)", rmi_lookup_name, key_type.c_type())
-    };
-    writeln!(code_output, "{} {{", lookup_sig)?;
+    learning_headers(code_output)?;
 
-    let mut needed_vars = HashSet::new();
-    if rmi.rmi.len() > 1 {
-        needed_vars.insert("size_t modelIndex;");
+    /* P4 header definitions */
+    writeln!(code_output,
+"
+/* metadata struct definition */
+
+struct metadata {{ /* empty */ }}
+
+/* headers struct definition */
+
+struct headers {{
+    ethernet_t ethernet;
+    learned_t learned;
+}}
+"
+    )?;
+
+    learning_normalization(code_output)?;
+
+    /* get all of the required stdlib functions together */
+    let mut func_sigs = Vec::new();
+    for layer in rmi.rmi.iter() {
+        for stdlib in layer[0].standard_functions() {
+            func_sigs.push(stdlib.code().to_string());
+        }
     }
 
-    // determine if we have any layers with float (fpred) or int (ipred) outputs
+    /* next, the model functions */
     for layer in rmi.rmi.iter() {
+        func_sigs.push(layer[0].code());
+    }
+
+    for sig in func_sigs.iter().unique() {
+        writeln!(code_output, "{}", sig)?;
+    }
+
+    /* other helper functions */
+    writeln!(code_output,
+"
+/* ====================== Other helper functions ====================== */
+action double_to_int(in double_t input, out uint64_t result) {{
+    bit<128> temp = ((bit<128>) input.mantissa) | (bit<128>) HIDDEN_BIT;
+    if (input.sign == SIGN_MINUS) {{
+        result = 0; return;
+    }} else if (input.exponent < EXPONENT_BIAS) {{
+        temp = temp >> ((bit<8>) (EXPONENT_BIAS - input.exponent));
+    }} else if (input.exponent > EXPONENT_BIAS) {{
+        temp = temp << ((bit<8>) (input.exponent - EXPONENT_BIAS));
+    }}
+
+    temp = temp >> 52;
+    result = (uint64_t) temp;
+}}
+
+action f_clamp(in uint64_t input, in uint64_t bound, out uint64_t result) {{
+    result = input > bound ? bound : input;
+}}
+"
+)?;
+
+    /* create tables for all layers that need it */
+    let mut needed_vars: Vec<String> = Vec::new(); // vec to keep order
+    let mut layer_params: Vec<LayerParams> = rmi.rmi.iter().enumerate() // vec to keep order
+        .map(|(layer_idx, models)| params_for_layer(layer_idx, models)).collect();
+
+    let lle = &rmi.last_layer_max_l1s;
+    if lle.len() > 1 {
+        let old_last = layer_params.pop().unwrap();
+        let new_last = old_last.with_zipped_errors(lle);
+
+        layer_params.push(new_last);
+    }
+
+    writeln!(code_output, "/* ====================== Learned Models ====================== */")?;
+    trace!("Layer parameters:");
+    for lp in layer_params.iter() {
+        trace!("{}", lp);
+        lp.table_code(namespace, data_dir, &mut needed_vars, code_output)?;
+    }
+
+    for (layer_idx, layer) in rmi.rmi.iter().enumerate() {
+        needed_vars.push(format!("Learned{}() l{}_{};", first_uppercase(layer[0].function_name()), layer_idx, layer[0].function_name()));
         match layer[0].output_type() {
-            ModelDataType::Int => needed_vars.insert("uint64_t ipred;"),
-            ModelDataType::Float => needed_vars.insert("double fpred;"),
-            ModelDataType::Int128 => needed_vars.insert("uint128_t i128pred;"),
+            ModelDataType::Int => needed_vars.push("uint64_t ipred;".to_string()),
+            ModelDataType::Float => needed_vars.push("double_t fpred;".to_string()),
         };
     }
 
-    for var in needed_vars {
-        writeln!(code_output, "  {}", var)?;
-    }
+    /* generating the actual lookup function */
+    writeln!(code_output, "control LearnedLookup(in double_t input_key, out uint64_t guess, out uint64_t guess_err) {{")?;
+
+        if rmi.rmi.len() > 1 { needed_vars.push("uint64_t model_index;".to_string()); }
+        for var in needed_vars.iter().unique() {
+            writeln!(code_output, "    {}", var)?;
+        }
+
+        writeln!(code_output, "    apply {{")?;
+
+            let mut last_model_output = key_type.to_model_data_type();
+            let mut needs_bounds_check = true;
+
+            for (layer_idx, layer) in rmi.rmi.iter().enumerate() {
+                let layer_param = &layer_params[layer_idx];
+                let target_pred = match layer[0].output_type() {
+                    ModelDataType::Int => "ipred",
+                    ModelDataType::Float => "fpred",
+                };
+
+                if layer.len() == 1 { // use constant indexing, we are at the first layer
+                    let constants = layer[0].params().iter().map(|param| param.p4_val()).join(", "); // getting these directly from the Model
+
+                    writeln!(code_output, "        l{}_{}.apply({}, input_key, {});", layer_idx, layer[0].function_name(), constants, target_pred)?;
+                } else { // we need to get the model index based on the previous prediction, and then use ref accessing
+                    let param_names = layer[0].params().iter().enumerate().map(|(param_idx, _)| layer_param.param_name(param_idx, layer_idx)).join(", ");
+
+                    writeln!(code_output, "{}", pred_to_model_index!(last_model_output))?;
+                    if needs_bounds_check {
+                        writeln!(code_output, "        f_clamp(model_index, {}, model_index);", ModelParam::from(layer.len()).p4_val())?;
+                    }
+
+                    writeln!(code_output, "        l{}_lookup.apply(model_index, {}, guess_err);", layer_idx, param_names)?;
+                    writeln!(code_output, "        l{}_{}.apply({}, input_key, {});", layer_idx, layer[0].function_name(), param_names, target_pred)?;
+                }
+                last_model_output = layer[0].output_type();
+                needs_bounds_check = layer[0].needs_bounds_check();
+            }
+
+            writeln!(code_output, "{}", pred_to_model_index!(last_model_output))?;
+            writeln!(code_output, "        f_clamp(model_index, {}, guess);", ModelParam::from(rmi.num_rmi_rows - 1).p4_val())?; // always bounds check the last level
+
+        writeln!(code_output, "    }}")?;
+
+    writeln!(code_output, "}}")?;
+
+    /* P4 parsers, ingress & egress pipelines */
+    writeln!(code_output,
+"
+/*************************************************************************
+*********************** P A R S E R  ***********************************
+*************************************************************************/
+
+parser LearnedParser(packet_in packet, out headers hdr, inout metadata meta, inout standard_metadata_t standard_metadata) {{
+    state start {{
+        transition parse_ethernet;
+    }}
+
+    state parse_ethernet {{
+        packet.extract(hdr.ethernet);
+        transition select(hdr.ethernet.etherType) {{
+            TYPE_LEARNED: parse_learned;
+            default: accept; // do not transition to parse learned state (will result in invalid learned header ; look at https://github.com/p4lang/tutorials/issues/308)
+        }}
+    }}
+
+    state parse_learned {{
+        packet.extract(hdr.learned);
+        transition accept;
+    }}
+}}
+
+
+/*************************************************************************
+************   C H E C K S U M    V E R I F I C A T I O N   *************
+*************************************************************************/
+
+control LearnedVerifyChecksum(inout headers hdr, inout metadata meta) {{
+    apply {{  }}
+}}
+
+/*************************************************************************
+**************  I N G R E S S   P R O C E S S I N G   *******************
+*************************************************************************/
+
+control LearnedIngress(inout headers hdr, inout metadata meta, inout standard_metadata_t standard_metadata) {{
+    LearnedLookup() lookup_instance;
+
+    action forward_back() {{
+        macAddr_t tmp = hdr.ethernet.dstAddr;
+        hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
+        hdr.ethernet.srcAddr = tmp;
+
+        standard_metadata.egress_spec = standard_metadata.ingress_port;
+    }}
+
+    apply {{
+        if (hdr.learned.isValid()) {{
+            lookup_instance.apply(hdr.learned.key, hdr.learned.guess, hdr.learned.err);
+            forward_back();
+        }}
+    }}
+}}
+
+/*************************************************************************
+****************  E G R E S S   P R O C E S S I N G   *******************
+*************************************************************************/
+
+control LearnedEgress(inout headers hdr, inout metadata meta, inout standard_metadata_t standard_metadata) {{
+    apply {{  }}
+}}
+
+/*************************************************************************
+*************   C H E C K S U M    C O M P U T A T I O N   **************
+*************************************************************************/
+
+control LearnedComputeChecksum(inout headers hdr, inout metadata meta) {{
+    apply {{ }}
+}}
+
+
+/*************************************************************************
+***********************  D E P A R S E R  *******************************
+*************************************************************************/
+
+control LearnedDeparser(packet_out packet, in headers hdr) {{
+    apply {{
+        packet.emit(hdr.ethernet);
+        packet.emit(hdr.learned);
+    }}
+}}
+
+/*************************************************************************
+***********************  S W I T C H  *******************************
+*************************************************************************/
+
+V1Switch(
+LearnedParser(),
+LearnedVerifyChecksum(),
+LearnedIngress(),
+LearnedEgress(),
+LearnedComputeChecksum(),
+LearnedDeparser()
+) main;
+"
+    )?;
 
     let model_size_bytes = rmi_size(&rmi);
     info!("Generated model size: {:?} ({} bytes)", ByteSize(model_size_bytes), model_size_bytes);
 
-    let mut last_model_output = key_type.to_model_data_type();
-    let mut needs_bounds_check = true;
-
-    for (layer_idx, layer) in rmi.rmi.iter().enumerate() {
-        let layer_param = &layer_params[layer_idx];
-        let required_type = layer[0].input_type();
-
-        let current_model_output = layer[0].output_type();
-
-        let var_name = match current_model_output {
-            ModelDataType::Int => "ipred",
-            ModelDataType::Float => "fpred",
-            ModelDataType::Int128 => "i128pred"
-        };
-
-        let num_parameters = layer[0].params().len();
-        if layer.len() == 1 {
-            // use constant indexing, only one model
-            write!(
-                code_output,
-                "  {} = {}(",
-                var_name,
-                layer[0].function_name()
-            )?;
-
-            for pidx in 0..num_parameters {
-                layer_param.access_by_const(code_output, pidx)?;
-                write!(code_output, ", ")?;
-            }
-        } else {
-            // we need to get the model index based on the previous
-            // prediction, and then use ref accessing
-            writeln!(
-                code_output,
-                "  modelIndex = {};",
-                model_index_from_output!(last_model_output, layer.len(), needs_bounds_check)
-            )?;
-
-            write!(
-                code_output,
-                "  {} = {}(",
-                var_name,
-                layer[0].function_name()
-            )?;
-
-            for pidx in 0..num_parameters {
-                layer_param.access_by_ref(code_output, "modelIndex", pidx)?;
-                write!(code_output, ", ")?;
-            }
-        }
-        writeln!(code_output, "({})key);", required_type.c_type())?;
-
-        last_model_output = layer[0].output_type();
-        needs_bounds_check = layer[0].needs_bounds_check();
-    }
-
-    writeln!(code_output, "{}", str::from_utf8(&report_lle).unwrap())?;
-
-    writeln!(
-        code_output,
-        "  return {};",
-        model_index_from_output!(last_model_output, rmi.num_rmi_rows, true)
-    )?; // always bounds check the last level
-    writeln!(code_output, "}}")?;
-
-    if rmi.cache_fix.is_some() {
-        generate_cache_fix_code(code_output, &rmi, array_name!(layer_params.len()-1))?;
-    }
-    
-    writeln!(code_output, "}} // namespace")?;
-
-    // write out our forward declarations
-    writeln!(header_output, "#include <cstddef>")?;
-    writeln!(header_output, "#include <cstdint>")?;
-    writeln!(header_output, "namespace {} {{", namespace)?;
-
-    writeln!(header_output, "bool load(char const* dataPath);")?;
-    writeln!(header_output, "void cleanup();")?;
-
-    writeln!(
-        header_output,
-        "const size_t RMI_SIZE = {};",
-        model_size_bytes
-    )?;
-    assert!(rmi.build_time <= u128::from(std::u64::MAX));
-    writeln!(
-        header_output,
-        "const uint64_t BUILD_TIME_NS = {};",
-        rmi.build_time
-    )?;
-    writeln!(header_output, "const char NAME[] = \"{}\";", namespace)?;
-    if rmi.cache_fix.is_none() {
-        writeln!(header_output, "{};", lookup_sig)?;
-    } else {
-        writeln!(header_output, "uint64_t lookup(uint64_t key, size_t* err);")?;
-    }
-    writeln!(header_output, "}}")?;
-
     return Result::Ok(());
 }
 
-
-pub fn output_rmi(namespace: &str,
-                  mut trained_model: TrainedRMI,
-                  data_dir: &str,
-                  key_type: KeyType,
-                  include_errors: bool) -> Result<(), std::io::Error> {
-    
-    let f1 = File::create(format!("{}.cpp", namespace)).expect("Could not write RMI CPP file");
+pub fn output_rmi(namespace: &str, mut trained_model: TrainedRMI, data_dir: &str, key_type: KeyType) -> Result<(), std::io::Error> {
+    let f1 = File::create(format!("{}.p4", namespace)).expect("Could not write RMI P4 file");
     let mut bw1 = BufWriter::new(f1);
-    
-    let f2 =
-        File::create(format!("{}_data.h", namespace)).expect("Could not write RMI data file");
-    let mut bw2 = BufWriter::new(f2);
-    
-    let f3 = File::create(format!("{}.h", namespace)).expect("Could not write RMI header file");
-    let mut bw3 = BufWriter::new(f3);
 
-    if !include_errors {
-        trained_model.last_layer_max_l1s.clear();
+    return generate_code(&mut bw1, namespace, trained_model, data_dir, key_type);
+}
+
+impl fmt::Display for LayerParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LayerParams::Constant(idx, params) =>
+                write!(f, "Constant(idx: {}, len: {})", idx, params.len()),
+            LayerParams::Array(idx, ppm, params) =>
+                write!(f, "Array(idx: {}, ppm: {}, len: {})", idx, ppm, params.len()),
+            LayerParams::MixedArray(idx, ppm, params) =>
+                write!(f, "MixedArray(idx: {}, ppm: {}, len: {})", idx, ppm, params.len())
+        }
     }
-
-    return generate_code(
-        &mut bw1,
-        &mut bw2,
-        &mut bw3,
-        namespace,
-        trained_model,
-        data_dir,
-        key_type
-    );
-        
-    
 }

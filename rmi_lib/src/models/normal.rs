@@ -1,10 +1,10 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
+
 
 use crate::models::*;
 use std::f64;
@@ -37,7 +37,7 @@ fn ncdf<T: TrainingKey>(loc_data: &RMITrainingData<T>) -> (f64, f64, f64) {
         mean += x / n;
         scale = f64::max(scale, y as f64);
     }
-    
+
     for (inp, _y) in loc_data.iter() {
         let x = inp.as_float();
         stdev += (x - mean).powf(2.0)
@@ -118,10 +118,11 @@ inline double ncdf(double mean, double stdev, double scale, double inp) {
     fn function_name(&self) -> String {
         return String::from("ncdf");
     }
-    fn standard_functions(&self) -> HashSet<StdFunctions> {
-        let mut to_r = HashSet::new();
-        to_r.insert(StdFunctions::EXP1);
-        to_r.insert(StdFunctions::PHI);
+
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::EXP1);
+        to_r.push(StdFunctions::PHI);
         return to_r;
     }
 }
@@ -193,10 +194,11 @@ inline double lncdf(double mean, double stdev, double scale, double inp) {
     fn function_name(&self) -> String {
         return String::from("lncdf");
     }
-    fn standard_functions(&self) -> HashSet<StdFunctions> {
-        let mut to_r = HashSet::new();
-        to_r.insert(StdFunctions::EXP1);
-        to_r.insert(StdFunctions::PHI);
+    
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::EXP1);
+        to_r.push(StdFunctions::PHI);
         return to_r;
     }
 }

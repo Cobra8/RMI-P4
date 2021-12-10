@@ -5,3 +5,6 @@ Cargo.lock
 *\#
 \#*
 rmi_data
+.ftpconfig
+.ftpignore
+generate_learned.sh

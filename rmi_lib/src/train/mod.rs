@@ -1,18 +1,16 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
+
 
 use crate::models::*;
-use crate::cache_fix::cache_fix;
 use log::*;
 use std::time::SystemTime;
 
 mod two_layer;
-//mod multi_layer;
 mod lower_bound_correction;
 
 pub struct TrainedRMI {
@@ -32,24 +30,23 @@ pub struct TrainedRMI {
     pub build_time: u128
 }
 
-fn train_model<T: TrainingKey>(model_type: &str,
-                              data: &RMITrainingData<T>) -> Box<dyn Model> {
+fn train_model<T: TrainingKey>(model_type: &str, data: &RMITrainingData<T>) -> Box<dyn Model> {
     let model: Box<dyn Model> = match model_type {
         "linear" => Box::new(LinearModel::new(data)),
         "robust_linear" => Box::new(RobustLinearModel::new(data)),
         "linear_spline" => Box::new(LinearSplineModel::new(data)),
         "cubic" => Box::new(CubicSplineModel::new(data)),
-        "loglinear" => Box::new(LogLinearModel::new(data)),
-        "normal" => Box::new(NormalModel::new(data)),
-        "lognormal" => Box::new(LogNormalModel::new(data)),
-        "radix" => Box::new(RadixModel::new(data)),
-        "radix8" => Box::new(RadixTable::new(data, 8)),
-        "radix18" => Box::new(RadixTable::new(data, 18)),
-        "radix22" => Box::new(RadixTable::new(data, 22)),
-        "radix26" => Box::new(RadixTable::new(data, 26)),
-        "radix28" => Box::new(RadixTable::new(data, 28)),
-        "bradix" => Box::new(BalancedRadixModel::new(data)),
-        "histogram" => Box::new(EquidepthHistogramModel::new(data)),
+        // "loglinear" => Box::new(LogLinearModel::new(data)),
+        // "normal" => Box::new(NormalModel::new(data)),
+        // "lognormal" => Box::new(LogNormalModel::new(data)),
+        // "radix" => Box::new(RadixModel::new(data)),
+        // "radix8" => Box::new(RadixTable::new(data, 8)),
+        // "radix18" => Box::new(RadixTable::new(data, 18)),
+        // "radix22" => Box::new(RadixTable::new(data, 22)),
+        // "radix26" => Box::new(RadixTable::new(data, 26)),
+        // "radix28" => Box::new(RadixTable::new(data, 28)),
+        // "bradix" => Box::new(BalancedRadixModel::new(data)),
+        // "histogram" => Box::new(EquidepthHistogramModel::new(data)), /* not supporting this model in P4! */
         _ => panic!("Unknown model type: {}", model_type),
     };
 
@@ -84,19 +81,6 @@ fn validate(model_spec: &[String]) {
     }
 }
 
-/*fn test_rmi_input(test_key: u64, data: &RMITrainingData, rmi: &TrainedRMI) {
-    let correct = data.lower_bound(test_key);
-    println!("Predicting {}", test_key);
-    let (guess, err) = rmi.test_predict(test_key);
-    println!("Model prediction for lookup {}: {} with error {}",
-             test_key, guess, err);
-    
-    println!("({}, {}), {}",
-             guess - err,
-             guess + err,
-             correct);
-}*/
-
 pub fn train<T: TrainingKey>(data: &RMITrainingData<T>,
                             model_spec: &str, branch_factor: u64) -> TrainedRMI {
 
@@ -116,7 +100,7 @@ pub fn train<T: TrainingKey>(data: &RMITrainingData<T>,
             .map(|d| d.as_nanos())
             .unwrap_or(std::u128::MAX);
         res.build_time = build_time;
-        
+
         return res;
     }
 
@@ -144,41 +128,11 @@ pub fn train_for_size<T: TrainingKey>(data: &RMITrainingData<T>,
     info!("Found RMI config {} {} with size {} and average log2 {}",
           models, bf, config.size, config.average_log2_error);
     let mut res = train(data, models.as_str(), bf);
-    
+
     let build_time = SystemTime::now()
             .duration_since(start_time)
             .map(|d| d.as_nanos())
             .unwrap_or(std::u128::MAX);
-    res.build_time = build_time;
-    return res;
-}
-
-pub fn train_bounded(data: &RMITrainingData<u64>,
-                     model_spec: &str,
-                     branch_factor: u64,
-                     line_size: usize) -> TrainedRMI {
-    let start_time = SystemTime::now();
-    // first, transform our data into error-bounded spline points
-    let spline = cache_fix(data, line_size);
-    std::mem::drop(data);
-
-    // reindex the spline points so we can build an RMI on top
-    let reindexed_splines: Vec<(u64, usize)> = spline.iter()
-        .enumerate()
-        .map(|(idx, (key, _old_offset))| (*key, idx))
-        .collect();
-    
-    // construct new training data from our spline points
-    let mut new_data = RMITrainingData::new(Box::new(reindexed_splines));
-
-    let mut res = crate::train(&mut new_data, model_spec, branch_factor);
-    res.cache_fix = Some((line_size, spline));
-    res.num_data_rows = data.len();
-    
-    let build_time = SystemTime::now()
-        .duration_since(start_time)
-        .map(|d| d.as_nanos())
-        .unwrap_or(std::u128::MAX);
     res.build_time = build_time;
     return res;
 }

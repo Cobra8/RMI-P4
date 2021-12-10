@@ -1,9 +1,9 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
+//
+// < end copyright >
 
 use crate::models::*;
 use superslice::*;
@@ -16,7 +16,7 @@ pub fn num_bits(largest_target: u64) -> u8 {
     nbits += 1;
   }
   assert!(nbits >= 1);
-  
+
   return nbits;
 }
 
@@ -32,7 +32,7 @@ pub fn common_prefix_size<T: TrainingKey>(data: &RMITrainingData<T>) -> u8 {
   let any_zeros = !no_ones;
 
   let prefix_bits = any_zeros ^ any_ones;
-  return (!prefix_bits).leading_zeros() as u8;        
+  return (!prefix_bits).leading_zeros() as u8;
 }
 
 fn common_prefix_size2(data: &[u64]) -> u8 {
@@ -47,7 +47,7 @@ fn common_prefix_size2(data: &[u64]) -> u8 {
   let any_zeros = !no_ones;
 
   let prefix_bits = any_zeros ^ any_ones;
-  return (!prefix_bits).leading_zeros() as u8;        
+  return (!prefix_bits).leading_zeros() as u8;
 }
 
 
@@ -59,7 +59,7 @@ pub fn radix_index(points: &[u64], num_bits: u8) -> Vec<u64> {
     warn!("Radix index currently assumes the common prefix size is 0, but it was {}",
           cps);
   }
-  
+
   let mut radix_index: Vec<u64> = vec![0 ; 1 << num_bits];
 
   let mut last_radix = 0;
@@ -68,7 +68,7 @@ pub fn radix_index(points: &[u64], num_bits: u8) -> Vec<u64> {
     assert!(radix < radix_index.len() as u64);
 
     if radix == last_radix { continue; }
-    
+
     for i in last_radix+1..radix {
       radix_index[i as usize] = idx as u64; //radix_index[last_radix as usize] + 1;
     }
@@ -79,10 +79,10 @@ pub fn radix_index(points: &[u64], num_bits: u8) -> Vec<u64> {
   for i in last_radix+1..radix_index.len() as u64 {
     radix_index[i as usize] = points.len() as u64;
   }
-  
+
   // end point
   radix_index.push(points.len() as u64);
-  
+
   // verify the radix construction
   for p in points {
     let radix = p >> (64 - num_bits);
@@ -102,11 +102,10 @@ pub fn radix_index(points: &[u64], num_bits: u8) -> Vec<u64> {
 }
 
 
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  
+
   #[test]
   fn test_common_prefix1() {
     let data = ModelData::IntKeyToIntPos(vec![

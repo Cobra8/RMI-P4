@@ -1,11 +1,11 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
- 
+//
+// < end copyright >
+
+
 
 use crate::models::*;
 
@@ -65,15 +65,28 @@ impl Model for LinearSplineModel {
 
     fn code(&self) -> String {
         return String::from(
-            "
-inline double linear(double alpha, double beta, double inp) {
-    return std::fma(beta, inp, alpha);
-}",
+"
+control LearnedLinear(in double_t a, in double_t b, in double_t input_key, out double_t result) {
+    FloatingFusedMultiplyAdd() fma_instance;
+
+    apply {
+        fma_instance.apply(b, input_key, a, result);
+    }
+}
+"
         );
     }
 
     fn function_name(&self) -> String {
         return String::from("linear");
+    }
+
+    fn standard_functions(&self) -> Vec<StdFunctions> {
+        let mut to_r = Vec::new();
+        to_r.push(StdFunctions::ADD);
+        to_r.push(StdFunctions::MULTIPLY);
+        to_r.push(StdFunctions::FMA);
+        return to_r;
     }
 
     fn set_to_constant_model(&mut self, constant: u64) -> bool {

@@ -1,10 +1,10 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
+
 
 use crate::models::utils::{common_prefix_size, num_bits};
 use crate::models::*;
@@ -72,9 +72,11 @@ inline uint64_t radix(uint64_t prefix_length, uint64_t bits, uint64_t inp) {
     fn function_name(&self) -> String {
         return String::from("radix");
     }
+    
     fn needs_bounds_check(&self) -> bool {
         return false;
     }
+
     fn restriction(&self) -> ModelRestriction {
         return ModelRestriction::MustBeTop;
     }
@@ -109,7 +111,7 @@ impl RadixTable {
         }
 
         for i in (last_radix as usize + 1)..hint_table.len() {
-            hint_table[i as usize] = hint_table.len() as u32; 
+            hint_table[i as usize] = hint_table.len() as u32;
         }
 
         return RadixTable {
@@ -128,7 +130,7 @@ impl Model for RadixTable {
         let num_bits = if prefix + bits > 64 { 0 } else { 64 - (prefix + bits) };
         let res = ((as_int << prefix) >> prefix) >> num_bits;
         let idx = self.hint_table[res as usize] as u64;
-        
+
         return idx;
     }
 
@@ -140,7 +142,11 @@ impl Model for RadixTable {
     }
 
     fn params(&self) -> Vec<ModelParam> {
-        return vec![self.hint_table.clone().into()];
+        let mut res: Vec<ModelParam> = Vec::new();
+        for val in &self.hint_table {
+            res.push(ModelParam::from(*val))
+        }
+        return res;
     }
 
     fn code(&self) -> String {
@@ -149,7 +155,7 @@ impl Model for RadixTable {
         } else {
             64 - (self.prefix_bits + self.table_bits)
         };
-        
+
         return format!(
             "
 inline uint64_t radix_table(const uint32_t* table, const uint64_t inp) {{
