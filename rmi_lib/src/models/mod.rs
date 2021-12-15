@@ -537,6 +537,24 @@ impl ModelParam {
         }
     }
 
+    pub fn p4_param_amount(&self) -> usize {
+        match self {
+            ModelParam::Int(_) => 1,
+            ModelParam::Float(_) => 3,
+        }
+    }
+
+    pub fn python_assign(&self, name: String) -> Vec<String> {
+        match self {
+            ModelParam::Int(_) => vec!(format!("'{}_input': {}", name, name)),
+            ModelParam::Float(_) => vec!(
+                format!("'{}_sign': ({} & SIGN_MASK) >> 63", name, name),
+                format!("'{}_exponent': ({} & EXPONENT_MASK) >> 52", name , name),
+                format!("'{}_mantissa': {} & MANTISSA_MASK", name, name)
+            )
+        }
+    }
+
     pub fn p4_val(&self) -> String {
         match self {
             ModelParam::Int(v) => format!("0x{}", hex::encode(v.to_be_bytes())),

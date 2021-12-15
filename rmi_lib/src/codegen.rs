@@ -14,16 +14,11 @@ use bytesize::ByteSize;
 use log::*;
 use std::io::Write;
 use std::str;
+use std::fs;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::fmt;
-
-macro_rules! array_name {
-    ($layer: expr) => {
-        format!("L{}_PARAMETERS", $layer)
-    }
-}
 
 macro_rules! param_enumeration {
     ($idx: expr) => { (["first", "second", "third", "fourth", "fifth", "sixth"])[$idx] }
@@ -70,12 +65,13 @@ impl LayerParams {
         match self {
             LayerParams::Constant(_, _) => (),
             LayerParams::Array(idx, _, _) | LayerParams::MixedArray(idx, _, _) => {
-                let data_path = Path::new(&data_dir).join(format!("{}_{}", namespace, array_name!(idx)));
+                let data_path = Path::new(&data_dir).join(format!("{}_L{}_PARAMETERS", namespace, idx));
                 let f = File::create(data_path).expect("Could not write data file to RMI directory");
                 let mut bw = BufWriter::new(f);
                 self.write_to(&mut bw)?; // write to data file
 
                 let model_items = self.params()[0..self.params_per_model()].to_vec();
+                let zero_params = vec![0; model_items.iter().map(|param| param.p4_param_amount()).sum()].iter().map(|x| 0).join(", ");
 
                 let args = model_items.iter().enumerate().map(|(param_idx, param)|
                     format!("out {} {}", param.p4_type(), self.param_name(param_idx, *idx))
@@ -92,11 +88,11 @@ impl LayerParams {
                     table_code.push(format!("    table l{}_model_lookup {{", *idx));
                         table_code.push("        key = { model_index: exact; }".to_string());
                         table_code.push("        actions = { assign_variables; NoAction; }".to_string());
-                        table_code.push("        const default_action = assign_variables(0, 0, 0, 0, 0, 0, 0);".to_string());
+                        table_code.push(format!("        const default_action = assign_variables({});", zero_params));
                         table_code.push(format!("        const size = {};", self.size()));
                     table_code.push("    }".to_string());
 
-                    table_code.push(format!("    apply {{ l{}_model_lookup.apply(); }}", *idx));
+                    table_code.push(format!("    apply {{ assign_variables({}); l{}_model_lookup.apply(); }}", zero_params, *idx));
                 table_code.push("}".to_string());
 
                 needed_vars.push(format!("L{}_ModelLookup() l{}_lookup;", *idx, *idx));
@@ -106,10 +102,59 @@ impl LayerParams {
             }
         };
 
-        for line in table_code {
-            writeln!(target, "{}", line)?;
-        }
+        for line in table_code { writeln!(target, "{}", line)?; }
+        return Result::Ok(());
+    }
 
+    fn runtime_code<T: Write>(&self, namespace: &str, data_dir: &str, target: &mut T) -> Result<(), std::io::Error> {
+        let mut runtime_code = Vec::new();
+
+        match self {
+            LayerParams::Constant(_, _) => (),
+            LayerParams::Array(idx, _, _) | LayerParams::MixedArray(idx, _, _) => {
+                let data_path = Path::new(&data_dir).join(format!("{}_L{}_PARAMETERS", namespace, idx));
+                let file_path = fs::canonicalize(&data_path).unwrap();
+
+                let model_items = self.params()[0..self.params_per_model()].to_vec();
+                let model_size: usize = model_items.iter().map(|param| param.size()).sum();
+
+                runtime_code.push(format!("def writeL{}Parameters(p4info_helper, switch):", *idx));
+                runtime_code.push(format!("    if not os.path.exists('{}'): print('Parameters file for layer {} not found!'); return", file_path.to_str().unwrap(), idx));
+                runtime_code.push("    model_index = 0".to_string());
+                runtime_code.push(format!("    with open('{}', 'rb') as file:", file_path.to_str().unwrap()));
+                runtime_code.push(format!("        bytes = file.read({} * BATCH_SIZE)", model_size));
+                runtime_code.push("        while bytes:".to_string());
+                runtime_code.push("            entries_batch = []".to_string());
+                runtime_code.push("            for index in range(0, BATCH_SIZE):".to_string());
+                runtime_code.push(format!("                model_bytes = bytes[({} * index):({} * (index + 1))]", model_size, model_size));
+
+                let mut offset = 0;
+                for (param_idx, param) in model_items.iter().enumerate() {
+                    runtime_code.push(format!("                {} = int.from_bytes(model_bytes[{}:{}], byteorder='little')", self.param_name(param_idx, *idx), offset, offset + param.size()));
+                    offset = offset + param.size();
+                }
+
+                runtime_code.push("                table_entry = p4info_helper.buildTableEntry(".to_string());
+                    runtime_code.push(format!("                    table_name='LearnedIngress.lookup_instance.l{}_lookup.l{}_model_lookup',", idx, idx));
+                    runtime_code.push("                    match_fields={ 'model_index': model_index },".to_string());
+                    runtime_code.push(format!("                    action_name='LearnedIngress.lookup_instance.l{}_lookup.assign_variables',", idx));
+
+                    let entry_params = model_items.iter().enumerate().flat_map(|(param_idx, param)| param.python_assign(self.param_name(param_idx, *idx))).join(", ");
+                    runtime_code.push(format!("                    action_params={{ {} }},", entry_params));
+                runtime_code.push("                )".to_string());
+
+                runtime_code.push("                entries_batch.append(table_entry)".to_string());
+                runtime_code.push("                model_index += 1".to_string());
+
+                runtime_code.push("            switch.WriteTableEntries(entries_batch)".to_string());
+                runtime_code.push("            print('Inserted %s table entries starting from index %s' % (BATCH_SIZE, model_index - BATCH_SIZE))".to_string());
+                runtime_code.push(format!("            bytes = file.read({} * BATCH_SIZE)", model_size));
+
+                runtime_code.push("    print('Done inserting all L1 parameters from file! (Inserted %s entries)' % (model_index))".to_string());
+            }
+        };
+
+        for line in runtime_code { writeln!(target, "{}", line)?; }
         return Result::Ok(());
     }
 
@@ -422,7 +467,9 @@ control FloatingNormalizer(inout overflow128_t overflow) {{
     return Ok(());
 }
 
-fn generate_code<T: Write>(code_output: &mut T, namespace: &str, rmi: TrainedRMI, data_dir: &str, key_type: KeyType) -> Result<(), std::io::Error> {
+fn generate_code<T: Write>(code_output: &mut T, runtime_output: &mut T, namespace: &str, data_dir: &str,
+    rmi: TrainedRMI, key_type: KeyType) -> Result<(), std::io::Error> {
+
     /* document head with custom types */
     writeln!(code_output,
 "
@@ -474,22 +521,11 @@ struct headers {{
 
     learning_normalization(code_output)?;
 
-    /* get all of the required stdlib functions together */
+    /* get all of the required stdlib and model functions */
     let mut func_sigs = Vec::new();
-    for layer in rmi.rmi.iter() {
-        for stdlib in layer[0].standard_functions() {
-            func_sigs.push(stdlib.code().to_string());
-        }
-    }
-
-    /* next, the model functions */
-    for layer in rmi.rmi.iter() {
-        func_sigs.push(layer[0].code());
-    }
-
-    for sig in func_sigs.iter().unique() {
-        writeln!(code_output, "{}", sig)?;
-    }
+    rmi.rmi.iter().flat_map(|layer| layer[0].standard_functions()).for_each(|stdlib| func_sigs.push(stdlib.code().to_string()));
+    rmi.rmi.iter().for_each(|layer| func_sigs.push(layer[0].code()));
+    for sig in func_sigs.iter().unique() { writeln!(code_output, "{}", sig)?; }
 
     /* other helper functions */
     writeln!(code_output,
@@ -690,17 +726,124 @@ LearnedDeparser()
 "
     )?;
 
+
     let model_size_bytes = rmi_size(&rmi);
     info!("Generated model size: {:?} ({} bytes)", ByteSize(model_size_bytes), model_size_bytes);
+
+    return generate_runtime(runtime_output, namespace, data_dir, &mut layer_params);
+}
+
+fn generate_runtime<T: Write>(runtime_output: &mut T, namespace: &str, data_dir: &str, layer_params: &mut Vec<LayerParams>) -> Result<(), std::io::Error> {
+
+    /* document head, imports and constants */
+    writeln!(runtime_output,
+"
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import grpc
+import struct
+from time import sleep
+
+from scapy.all import Packet, bind_layers
+from scapy.all import Packet, Ether, IP, TCP, UDP, Raw
+from scapy.all import IEEEFloatField, IEEEDoubleField, LongField, IntField
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../utils/')) # Import P4Runtime lib from parent utils dir (is there a better way?)
+
+import p4runtime_lib.bmv2
+import p4runtime_lib.helper
+from p4runtime_lib.error_utils import printGrpcError
+from p4runtime_lib.switch import ShutdownAllSwitchConnections
+
+LEARNED_TYPE = 0x8008
+BATCH_SIZE = 2048
+
+SIGN_MASK = 0x8000000000000000
+EXPONENT_MASK = 0x7FF0000000000000
+MANTISSA_MASK = 0x000FFFFFFFFFFFFF
+
+class P4Learned(Packet):
+    name = 'P4Learned'
+    fields_desc = [ IEEEDoubleField('key', float(0)), LongField('guess', 0), LongField('error', 0) ]
+
+bind_layers(Ether, P4Learned, type=LEARNED_TYPE)
+"
+    )?;
+
+    /* writeParameters functions */
+    for lp in layer_params.iter() {
+        lp.runtime_code(namespace, data_dir, runtime_output)?;
+    }
+
+    /* main, initialize switch connection */
+    writeln!(runtime_output,
+"
+def main(p4info_file_path, bmv2_file_path):
+    p4info_helper = p4runtime_lib.helper.P4InfoHelper(p4info_file_path)
+
+    try:
+        switch = p4runtime_lib.bmv2.Bmv2SwitchConnection(
+            name='s1',
+            address='127.0.0.1:50051',
+            device_id=0,
+            proto_dump_file='logs/s1-p4runtime-requests.txt')
+        switch.MasterArbitrationUpdate()
+
+        switch.SetForwardingPipelineConfig(p4info=p4info_helper.p4info, bmv2_json_file_path=bmv2_file_path)
+"
+    )?;
+
+    for lp in layer_params.iter() {
+        match lp {
+            LayerParams::Constant(_, _) => (),
+            LayerParams::Array(idx, _, _) | LayerParams::MixedArray(idx, _, _) => {
+                writeln!(runtime_output, "        writeL{}Parameters(p4info_helper, switch)", idx)?;
+            }
+        }
+    }
+
+    /* entry point, arg parser */
+    writeln!(runtime_output,
+"
+    except KeyboardInterrupt:
+        print(' Shutting down.')
+    except grpc.RpcError as e:
+        printGrpcError(e)
+
+    ShutdownAllSwitchConnections()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='P4-Learned Runtime-Controller')
+    parser.add_argument('--p4info', help='p4info proto in text format from p4c', type=str, action='store', required=False, default='./build/{}.p4.p4info.txt')
+    parser.add_argument('--bmv2-json', help='BMv2 JSON file from p4c', type=str, action='store', required=False, default='./build/{}.json')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.p4info):
+        parser.print_help()
+        print(\"\\np4info file not found: %s\\nHave you run 'make'?\" % args.p4info)
+        parser.exit(1)
+    if not os.path.exists(args.bmv2_json):
+        parser.print_help()
+        print(\"\\nBMv2 JSON file not found: %s\\nHave you run 'make'?\" % args.bmv2_json)
+        parser.exit(1)
+    main(args.p4info, args.bmv2_json)
+",
+    namespace, namespace)?;
 
     return Result::Ok(());
 }
 
-pub fn output_rmi(namespace: &str, mut trained_model: TrainedRMI, data_dir: &str, key_type: KeyType) -> Result<(), std::io::Error> {
+pub fn output_rmi(namespace: &str, trained_model: TrainedRMI, data_dir: &str, key_type: KeyType) -> Result<(), std::io::Error> {
     let f1 = File::create(format!("{}.p4", namespace)).expect("Could not write RMI P4 file");
     let mut bw1 = BufWriter::new(f1);
 
-    return generate_code(&mut bw1, namespace, trained_model, data_dir, key_type);
+    let f2 = File::create(format!("{}_runtime.py", namespace)).expect("Could not write RMI P4 file");
+    let mut bw2 = BufWriter::new(f2);
+
+    return generate_code(&mut bw1, &mut bw2, namespace, data_dir, trained_model, key_type);
 }
 
 impl fmt::Display for LayerParams {
