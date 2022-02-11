@@ -43,18 +43,11 @@ enum LayerParams {
 impl LayerParams {
 
     fn new(idx: usize, array_access: bool, params_per_model: usize, params: Vec<ModelParam>) -> LayerParams {
-        // first, if the underlying data is mixed, we can only support array mode.
         let first_param = params.first().unwrap();
-        let mixed = !params.iter().all(|p| first_param.is_same_type(p));
+        let mixed = !params.iter().all(|p| first_param.is_same_type(p)); // if the underlying data is mixed, we can only support array mode.
 
-        if mixed {
-            return LayerParams::MixedArray(idx, params_per_model, params);
-        }
-
-        let param_size_bytes: usize = params.iter().map(|p| p.size()).sum();
-        if array_access || param_size_bytes > 4096 {
-            return LayerParams::Array(idx, params_per_model, params);
-        }
+        if mixed { return LayerParams::MixedArray(idx, params_per_model, params); }
+        if array_access { return LayerParams::Array(idx, params_per_model, params); }
 
         return LayerParams::Constant(idx, params);
     }
@@ -71,7 +64,7 @@ impl LayerParams {
                 self.write_to(&mut bw)?; // write to data file
 
                 let model_items = self.params()[0..self.params_per_model()].to_vec();
-                let zero_params = vec![0; model_items.iter().map(|param| param.p4_param_amount()).sum()].iter().map(|x| 0).join(", ");
+                let zero_params = vec![0; model_items.iter().map(|param| param.p4_param_amount()).sum()].iter().map(|_| 0).join(", ");
 
                 let args = model_items.iter().enumerate().map(|(param_idx, param)|
                     format!("out {} {}", param.p4_type(), self.param_name(param_idx, *idx))
@@ -150,7 +143,7 @@ impl LayerParams {
                 runtime_code.push("            print('Inserted %s table entries starting from index %s' % (BATCH_SIZE, model_index - BATCH_SIZE))".to_string());
                 runtime_code.push(format!("            bytes = file.read({} * BATCH_SIZE)", model_size));
 
-                runtime_code.push("    print('Done inserting all L1 parameters from file! (Inserted %s entries)' % (model_index))".to_string());
+                runtime_code.push(format!("    print('Done inserting all L{} parameters from file! (Inserted %s entries)' % (model_index))", idx));
             }
         };
 
@@ -230,10 +223,10 @@ fn first_uppercase(s: String) -> String {
 }
 
 fn params_for_layer(layer_idx: usize, models: &[Box<dyn Model>]) -> LayerParams {
-    let params_per_model = models[0].params().len();
-    let params = models.iter().flat_map(|m| m.params()).collect();
-    return LayerParams::new(layer_idx, models.len() > 1, // array access on non-singleton layers
-                            params_per_model, params);
+    let params_per_model = models[0].params_per_model();
+    let params: Vec<ModelParam> = models.iter().flat_map(|m| m.params()).collect();
+
+    return LayerParams::new(layer_idx, models.len() > 1 || (params.len() / params_per_model) > 1, params_per_model, params); // array access on non-singleton layers
 }
 
 pub fn rmi_size(rmi: &TrainedRMI) -> u64 {
@@ -521,12 +514,6 @@ struct headers {{
 
     learning_normalization(code_output)?;
 
-    /* get all of the required stdlib and model functions */
-    let mut func_sigs = Vec::new();
-    rmi.rmi.iter().flat_map(|layer| layer[0].standard_functions()).for_each(|stdlib| func_sigs.push(stdlib.code().to_string()));
-    rmi.rmi.iter().for_each(|layer| func_sigs.push(layer[0].code()));
-    for sig in func_sigs.iter().unique() { writeln!(code_output, "{}", sig)?; }
-
     /* other helper functions */
     writeln!(code_output,
 "
@@ -556,6 +543,7 @@ action f_clamp(in uint64_t input, in uint64_t bound, out uint64_t result) {{
     let mut layer_params: Vec<LayerParams> = rmi.rmi.iter().enumerate() // vec to keep order
         .map(|(layer_idx, models)| params_for_layer(layer_idx, models)).collect();
 
+    /* append last layer errors to layer params */
     let lle = &rmi.last_layer_max_l1s;
     if lle.len() > 1 {
         let old_last = layer_params.pop().unwrap();
@@ -564,12 +552,20 @@ action f_clamp(in uint64_t input, in uint64_t bound, out uint64_t result) {{
         layer_params.push(new_last);
     }
 
-    writeln!(code_output, "/* ====================== Learned Models ====================== */")?;
+    writeln!(code_output, "/* ====================== Learned lookup tables ====================== */")?;
+
     trace!("Layer parameters:");
     for lp in layer_params.iter() {
         trace!("{}", lp);
         lp.table_code(namespace, data_dir, &mut needed_vars, code_output)?;
     }
+
+    /* get all of the required stdlib and model functions */
+    let mut func_sigs = Vec::new();
+    rmi.rmi.iter().flat_map(|layer| layer[0].standard_functions()).for_each(|stdlib| func_sigs.push(stdlib.code().to_string()));
+    func_sigs.push("/* ====================== Learned models ====================== */".to_string());
+    rmi.rmi.iter().for_each(|layer| func_sigs.push(layer[0].code()));
+    for sig in func_sigs.iter().unique() { writeln!(code_output, "{}", sig)?; }
 
     for (layer_idx, layer) in rmi.rmi.iter().enumerate() {
         needed_vars.push(format!("Learned{}() l{}_{};", first_uppercase(layer[0].function_name()), layer_idx, layer[0].function_name()));
@@ -594,16 +590,28 @@ action f_clamp(in uint64_t input, in uint64_t bound, out uint64_t result) {{
 
             for (layer_idx, layer) in rmi.rmi.iter().enumerate() {
                 let layer_param = &layer_params[layer_idx];
+                let input = match layer[0].input_type() {
+                    ModelDataType::Int => "model_index",
+                    ModelDataType::Float => "input_key",
+                };
                 let target_pred = match layer[0].output_type() {
                     ModelDataType::Int => "ipred",
                     ModelDataType::Float => "fpred",
                 };
 
-                if layer.len() == 1 { // use constant indexing, we are at the first layer
-                    let constants = layer[0].params().iter().map(|param| param.p4_val()).join(", "); // getting these directly from the Model
+                if layer.len() == 1 { // use constant indexing, we are on the first layer
+                    if let ModelDataType::Int = layer[0].input_type() {
+                        writeln!(code_output, "        double_to_int(input_key, model_index);")?;
+                    }
 
-                    writeln!(code_output, "        l{}_{}.apply({}, input_key, {});", layer_idx, layer[0].function_name(), constants, target_pred)?;
-                } else { // we need to get the model index based on the previous prediction, and then use ref accessing
+                    if (layer_param.params().len() / layer_param.params_per_model()) > 1 { // we have several values, cannot use constants (probably using RadixTable)
+                        writeln!(code_output, "        l{}_{}.apply({}, model_index);", layer_idx, layer[0].function_name(), input)?;
+                        writeln!(code_output, "        l{}_lookup.apply(model_index, {});", layer_idx, target_pred)?;
+                    } else {
+                        let constants = layer[0].params().iter().map(|param| param.p4_val()).join(", "); // getting these directly from the Model
+                        writeln!(code_output, "        l{}_{}.apply({}, {}, {});", layer_idx, layer[0].function_name(), constants, input, target_pred)?;
+                    }
+                } else { // we need to get the model index based on the previous prediction
                     let param_names = layer[0].params().iter().enumerate().map(|(param_idx, _)| layer_param.param_name(param_idx, layer_idx)).join(", ");
 
                     writeln!(code_output, "{}", pred_to_model_index!(last_model_output))?;

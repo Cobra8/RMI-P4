@@ -62,17 +62,18 @@ impl Model for RadixModel {
 
     fn code(&self) -> String {
         return String::from(
-            "
-inline uint64_t radix(uint64_t prefix_length, uint64_t bits, uint64_t inp) {
-    return (inp << prefix_length) >> (64 - bits);
-}",
+"
+control LearnedRadix(in uint64_t prefix_length, in uint64_t bits, in uint64_t input_key, out uint64_t result) {
+    apply { result = (input_key << ((bit<8>) prefix_length)) >> ((bit<8>) (64 - bits)); }
+}
+"
         );
     }
 
     fn function_name(&self) -> String {
         return String::from("radix");
     }
-    
+
     fn needs_bounds_check(&self) -> bool {
         return false;
     }
@@ -137,41 +138,44 @@ impl Model for RadixTable {
     fn input_type(&self) -> ModelDataType {
         return ModelDataType::Int;
     }
+
     fn output_type(&self) -> ModelDataType {
         return ModelDataType::Int;
     }
 
     fn params(&self) -> Vec<ModelParam> {
         let mut res: Vec<ModelParam> = Vec::new();
-        for val in &self.hint_table {
-            res.push(ModelParam::from(*val))
-        }
+        for val in &self.hint_table { res.push(ModelParam::from(*val)) }
         return res;
     }
 
+    fn params_per_model(&self) -> usize {
+        return 1;
+    }
+
     fn code(&self) -> String {
-        let num_bits = if self.prefix_bits + self.table_bits > 64 {
-            0
-        } else {
-            64 - (self.prefix_bits + self.table_bits)
-        };
+        let num_bits = if self.prefix_bits + self.table_bits > 64 { 0 }
+        else { 64 - (self.prefix_bits + self.table_bits) };
 
         return format!(
-            "
-inline uint64_t radix_table(const uint32_t* table, const uint64_t inp) {{
-    return table[((inp << {0}) >> {0}) >> {1}];
-}}", self.prefix_bits, num_bits
-        );
+"
+control LearnedRadixTable(in uint64_t input_key, out uint64_t result) {{
+    apply {{ result = ((input_key << {0}) >> {0}) >> {1}; }}
+}}
+",
+        self.prefix_bits, num_bits);
     }
 
     fn function_name(&self) -> String {
-        return String::from("radix_table");
+        return String::from("radixTable");
     }
+
     fn needs_bounds_check(&self) -> bool {
         return false;
     }
+
     fn restriction(&self) -> ModelRestriction {
-        return ModelRestriction::None;
+        return ModelRestriction::MustBeTop;
     }
 }
 

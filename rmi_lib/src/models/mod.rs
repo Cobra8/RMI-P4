@@ -551,7 +551,7 @@ impl ModelParam {
                 format!("'{}_sign': ({} & SIGN_MASK) >> 63", name, name),
                 format!("'{}_exponent': ({} & EXPONENT_MASK) >> 52", name , name),
                 format!("'{}_mantissa': {} & MANTISSA_MASK", name, name)
-            )
+            ),
         }
     }
 
@@ -572,21 +572,14 @@ impl ModelParam {
     pub fn write_to<T: Write>(&self, target: &mut T) -> Result<(), std::io::Error> {
         match self {
             ModelParam::Int(v) => target.write_u64::<LittleEndian>(*v),
-            ModelParam::Float(v) => target.write_f64::<LittleEndian>(*v)
+            ModelParam::Float(v) => target.write_f64::<LittleEndian>(*v),
         }
     }
 
     pub fn as_float(&self) -> f64 {
         match self {
             ModelParam::Int(v) => *v as f64,
-            ModelParam::Float(v) => *v
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            ModelParam::Int(_) => 1,
-            ModelParam::Float(_) => 1
+            ModelParam::Float(v) => *v,
         }
     }
 }
@@ -643,6 +636,10 @@ pub trait Model: Sync + Send {
 
     fn code(&self) -> String;
     fn function_name(&self) -> String;
+
+    fn params_per_model(&self) -> usize {
+        return self.params().len();
+    }
 
     fn standard_functions(&self) -> Vec<StdFunctions> {
         return Vec::new();

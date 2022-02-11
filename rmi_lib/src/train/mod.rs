@@ -36,16 +36,16 @@ fn train_model<T: TrainingKey>(model_type: &str, data: &RMITrainingData<T>) -> B
         "robust_linear" => Box::new(RobustLinearModel::new(data)),
         "linear_spline" => Box::new(LinearSplineModel::new(data)),
         "cubic" => Box::new(CubicSplineModel::new(data)),
-        // "loglinear" => Box::new(LogLinearModel::new(data)),
-        // "normal" => Box::new(NormalModel::new(data)),
-        // "lognormal" => Box::new(LogNormalModel::new(data)),
-        // "radix" => Box::new(RadixModel::new(data)),
-        // "radix8" => Box::new(RadixTable::new(data, 8)),
-        // "radix18" => Box::new(RadixTable::new(data, 18)),
-        // "radix22" => Box::new(RadixTable::new(data, 22)),
-        // "radix26" => Box::new(RadixTable::new(data, 26)),
-        // "radix28" => Box::new(RadixTable::new(data, 28)),
-        // "bradix" => Box::new(BalancedRadixModel::new(data)),
+        // "loglinear" => Box::new(LogLinearModel::new(data)), /* not supporting this model in P4! */
+        // "normal" => Box::new(NormalModel::new(data)), /* not supporting this model in P4! */
+        // "lognormal" => Box::new(LogNormalModel::new(data)), /* not supporting this model in P4! */
+        "radix" => Box::new(RadixModel::new(data)),
+        "radix8" => Box::new(RadixTable::new(data, 8)),
+        "radix18" => Box::new(RadixTable::new(data, 18)),
+        "radix22" => Box::new(RadixTable::new(data, 22)),
+        "radix26" => Box::new(RadixTable::new(data, 26)),
+        "radix28" => Box::new(RadixTable::new(data, 28)),
+        // "bradix" => Box::new(BalancedRadixModel::new(data)), /* not supporting this model in P4! */
         // "histogram" => Box::new(EquidepthHistogramModel::new(data)), /* not supporting this model in P4! */
         _ => panic!("Unknown model type: {}", model_type),
     };
